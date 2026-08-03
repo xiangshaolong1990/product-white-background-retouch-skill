@@ -32,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fallback-mode",
         choices=("background", "cutout"),
-        default="background",
-        help="Use background for translucent eyewear; cutout only for opaque products",
+        default="cutout",
+        help="Contrast-guided cutout preserves the complete silhouette; background is the conservative fallback",
     )
     parser.add_argument(
         "--shadow",
@@ -42,7 +42,14 @@ def parse_args() -> argparse.Namespace:
         help="Only applies to cutout fallback mode",
     )
     parser.add_argument("--debug-subject-mask", type=Path)
+    parser.add_argument("--debug-raw-subject-mask", type=Path)
+    parser.add_argument("--debug-guidance-image", type=Path)
     parser.add_argument("--debug-background-mask", type=Path)
+    parser.add_argument("--mask-contrast", type=float, default=1.35)
+    parser.add_argument("--mask-low", type=int, default=78)
+    parser.add_argument("--mask-high", type=int, default=184)
+    parser.add_argument("--mask-expand", type=int, default=1)
+    parser.add_argument("--mask-feather", type=float, default=0.8)
     return parser.parse_args()
 
 
@@ -105,11 +112,32 @@ def run_fallback(args: argparse.Namespace, output: Path) -> None:
         args.fallback_mode,
     ]
     if args.fallback_mode == "cutout":
-        command.extend(("--shadow", args.shadow))
+        command.extend(
+            (
+                "--shadow",
+                args.shadow,
+                "--mask-guide",
+                "contrast",
+                "--mask-contrast",
+                str(args.mask_contrast),
+                "--mask-low",
+                str(args.mask_low),
+                "--mask-high",
+                str(args.mask_high),
+                "--mask-expand",
+                str(args.mask_expand),
+                "--mask-feather",
+                str(args.mask_feather),
+            )
+        )
     if args.debug_subject_mask:
         command.extend(("--debug-subject-mask", str(args.debug_subject_mask)))
     if args.debug_background_mask:
         command.extend(("--debug-background-mask", str(args.debug_background_mask)))
+    if args.debug_raw_subject_mask:
+        command.extend(("--debug-raw-subject-mask", str(args.debug_raw_subject_mask)))
+    if args.debug_guidance_image:
+        command.extend(("--debug-guidance-image", str(args.debug_guidance_image)))
     subprocess.run(command, check=True)
     validate_image(output)
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "白底图精修"
-  short_description: "快速复用确认成片，完整保留镜片与半透明材质的白底精修"
-  default_prompt: "Use $product-white-background-retouch to retouch this eyewear photo in the approved first-version white-background style."
+  short_description: "先确认完整镜框，再局部AI修复镜片倒影的白底精修流程"
+  default_prompt: "Use $product-white-background-retouch to preserve the complete eyewear silhouette, create a clean white background, and locally repair unwanted lens reflections."

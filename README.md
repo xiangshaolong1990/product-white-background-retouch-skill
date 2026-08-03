@@ -1,6 +1,6 @@
 # Product White-Background Retouch Skill
 
-Codex skill for eyewear and product white-background retouching. It preserves lens tint, translucent frames, nose pads, logos, text, colour, and geometry while keeping only a small natural contact shadow.
+Codex skill for eyewear and product white-background retouching. It uses a contrast-enhanced guidance image to recover the complete product silhouette, composites untouched source pixels, and supports tightly masked AI repair for unwanted lens reflections.
 
 ## Install
 

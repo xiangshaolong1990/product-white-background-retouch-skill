@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -216,6 +216,47 @@ def vision_subject_mask(image: Image.Image) -> Image.Image:
     return mask
 
 
+def contrast_guidance_image(
+    image: Image.Image,
+    autocontrast_cutoff: int,
+    contrast: float,
+) -> Image.Image:
+    """Reveal pale product boundaries for segmentation without changing output pixels."""
+    guidance = ImageOps.autocontrast(
+        image.convert("RGB"),
+        cutoff=max(0, min(20, autocontrast_cutoff)),
+    )
+    return ImageEnhance.Contrast(guidance).enhance(max(0.1, contrast))
+
+
+def refine_subject_mask(
+    mask: Image.Image,
+    low: int,
+    high: int,
+    expand: int,
+    feather: float,
+) -> Image.Image:
+    """Complete the subject silhouette, then suppress broad soft-mask halos."""
+    low = max(0, min(254, low))
+    high = max(low + 1, min(255, high))
+    refined = mask.convert("L")
+    if expand > 0:
+        radius = max(1, min(20, expand)) * 2 + 1
+        refined = refined.filter(ImageFilter.MaxFilter(radius))
+    refined = refined.point(
+        lambda value: (
+            0
+            if value <= low
+            else 255
+            if value >= high
+            else round((value - low) * 255 / (high - low))
+        )
+    )
+    if feather > 0:
+        refined = refined.filter(ImageFilter.GaussianBlur(min(5.0, feather)))
+    return refined
+
+
 def subtle_contact_shadow(
     subject_mask: Image.Image,
     radius: int,
@@ -288,6 +329,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shadow-radius", type=int, default=12)
     parser.add_argument("--shadow-opacity", type=int, default=18)
     parser.add_argument("--shadow-offset", type=int, default=6)
+    parser.add_argument(
+        "--mask-guide",
+        choices=("contrast", "original"),
+        default="contrast",
+        help="Build the subject mask from a contrast guide or the untouched source",
+    )
+    parser.add_argument("--mask-contrast", type=float, default=1.35)
+    parser.add_argument("--mask-autocontrast-cutoff", type=int, default=1)
+    parser.add_argument("--mask-low", type=int, default=78)
+    parser.add_argument("--mask-high", type=int, default=184)
+    parser.add_argument("--mask-expand", type=int, default=1)
+    parser.add_argument("--mask-feather", type=float, default=0.8)
+    parser.add_argument("--debug-guidance-image", type=Path)
+    parser.add_argument("--debug-raw-subject-mask", type=Path)
     parser.add_argument("--debug-subject-mask", type=Path, help="Optional detected-subject mask PNG")
     parser.add_argument("--debug-background-mask", type=Path, help="Optional connected-background mask PNG")
     parser.add_argument("--corner-sample", type=int, default=32)
@@ -323,8 +378,26 @@ def main() -> None:
     original = ImageOps.exif_transpose(Image.open(args.input)).convert("RGBA")
     cleared_components = 0
     cleared_pixels = 0
+    raw_subject_mask: Image.Image | None = None
+    guidance: Image.Image | None = None
     if args.mode == "cutout":
-        subject_mask = vision_subject_mask(original)
+        guidance = (
+            contrast_guidance_image(
+                original,
+                args.mask_autocontrast_cutoff,
+                args.mask_contrast,
+            )
+            if args.mask_guide == "contrast"
+            else original.convert("RGB")
+        )
+        raw_subject_mask = vision_subject_mask(guidance)
+        subject_mask = refine_subject_mask(
+            raw_subject_mask,
+            args.mask_low,
+            args.mask_high,
+            args.mask_expand,
+            args.mask_feather,
+        )
         mask = ImageOps.invert(subject_mask)
         retouched = apply_cutout_background(
             original,
@@ -356,13 +429,25 @@ def main() -> None:
     if args.debug_subject_mask:
         args.debug_subject_mask.parent.mkdir(parents=True, exist_ok=True)
         subject_mask.save(args.debug_subject_mask, "PNG", optimize=True)
+    if args.debug_raw_subject_mask and raw_subject_mask is not None:
+        args.debug_raw_subject_mask.parent.mkdir(parents=True, exist_ok=True)
+        raw_subject_mask.save(args.debug_raw_subject_mask, "PNG", optimize=True)
+    if args.debug_guidance_image and guidance is not None:
+        args.debug_guidance_image.parent.mkdir(parents=True, exist_ok=True)
+        guidance.save(args.debug_guidance_image, "PNG", optimize=True)
     if args.debug_background_mask:
         args.debug_background_mask.parent.mkdir(parents=True, exist_ok=True)
         mask.save(args.debug_background_mask, "PNG", optimize=True)
 
-    background_pixels = sum(1 for value in mask.get_flattened_data() if value)
+    background_pixels = sum(1 for value in mask.getdata() if value)
     print(f"Saved: {args.output}")
     print(f"Mode: {args.mode}; shadow: {args.shadow}")
+    if args.mode == "cutout":
+        print(
+            "Mask guidance: "
+            f"{args.mask_guide}; contrast={args.mask_contrast}; "
+            f"range={args.mask_low}-{args.mask_high}; expand={args.mask_expand}"
+        )
     print(f"Source size: {original.size}; output size: {retouched.size}")
     print(f"Background pixels changed: {background_pixels}")
     print(f"Isolated protected components cleared: {cleared_components}")
