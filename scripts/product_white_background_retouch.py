@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import os
 from pathlib import Path
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -16,6 +18,15 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 VISION_SOURCE = SCRIPT_DIR / "vision_subject_mask.swift"
+ALPHA_MATTING_SCRIPT = SCRIPT_DIR / "alpha_matte_cutout.py"
+ALPHA_MATTING_VENV = (
+    Path.home()
+    / ".cache"
+    / "codex-product-white-background-retouch"
+    / "alpha-matting-venv"
+    / "bin"
+    / "python"
+)
 
 
 def corner_background_colors(image: Image.Image, sample_size: int) -> list[tuple[int, int, int]]:
@@ -201,9 +212,9 @@ def vision_subject_mask(image: Image.Image) -> Image.Image:
     helper = compile_vision_helper()
     with tempfile.TemporaryDirectory(prefix="product-cutout-") as temporary_directory:
         temporary = Path(temporary_directory)
-        normalized_input = temporary / "input.png"
+        normalized_input = temporary / "input.jpg"
         mask_output = temporary / "subject-mask.png"
-        image.convert("RGB").save(normalized_input, "PNG")
+        image.convert("RGB").save(normalized_input, "JPEG", quality=92, subsampling=0)
         subprocess.run(
             [str(helper), str(normalized_input), str(mask_output)],
             check=True,
@@ -255,6 +266,84 @@ def refine_subject_mask(
     if feather > 0:
         refined = refined.filter(ImageFilter.GaussianBlur(min(5.0, feather)))
     return refined
+
+
+def alpha_python_candidates(explicit: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(explicit.expanduser())
+    environment_python = os.environ.get("PRODUCT_RETOUCH_ALPHA_PYTHON")
+    if environment_python:
+        candidates.append(Path(environment_python).expanduser())
+    candidates.extend((ALPHA_MATTING_VENV, Path(sys.executable)))
+    return candidates
+
+
+def find_alpha_python(explicit: Path | None) -> Path | None:
+    seen: set[Path] = set()
+    for candidate in alpha_python_candidates(explicit):
+        candidate = candidate.expanduser().absolute()
+        if candidate in seen or not candidate.is_file():
+            continue
+        seen.add(candidate)
+        result = subprocess.run(
+            [str(candidate), "-c", "import numpy, scipy, pymatting, PIL"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return candidate
+    return None
+
+
+def alpha_matte_cutout(
+    input_path: Path,
+    raw_subject_mask: Image.Image,
+    alpha_python: Path,
+    foreground_threshold: int,
+    background_threshold: int,
+    foreground_erode: int,
+    background_erode: int,
+    margin: int,
+    max_matte_side: int,
+    debug_alpha_mask: Path | None,
+    debug_trimap: Path | None,
+) -> Image.Image:
+    if not ALPHA_MATTING_SCRIPT.is_file():
+        raise RuntimeError(f"Alpha matting helper not found: {ALPHA_MATTING_SCRIPT}")
+    with tempfile.TemporaryDirectory(prefix="product-alpha-matting-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        mask_path = temporary / "raw-subject-mask.png"
+        cutout_path = temporary / "cutout.png"
+        raw_subject_mask.save(mask_path, "PNG")
+        command = [
+            str(alpha_python),
+            str(ALPHA_MATTING_SCRIPT),
+            "--input",
+            str(input_path),
+            "--mask",
+            str(mask_path),
+            "--output",
+            str(cutout_path),
+            "--foreground-threshold",
+            str(foreground_threshold),
+            "--background-threshold",
+            str(background_threshold),
+            "--foreground-erode",
+            str(foreground_erode),
+            "--background-erode",
+            str(background_erode),
+            "--margin",
+            str(margin),
+            "--max-matte-side",
+            str(max_matte_side),
+        ]
+        if debug_alpha_mask:
+            command.extend(("--debug-alpha-mask", str(debug_alpha_mask)))
+        if debug_trimap:
+            command.extend(("--debug-trimap", str(debug_trimap)))
+        subprocess.run(command, check=True)
+        return Image.open(cutout_path).convert("RGBA").copy()
 
 
 def subtle_contact_shadow(
@@ -310,6 +399,27 @@ def apply_cutout_background(
     return Image.composite(image.convert("RGBA"), white, subject_mask)
 
 
+def apply_rgba_cutout_background(
+    cutout: Image.Image,
+    subject_mask: Image.Image,
+    shadow: str,
+    shadow_radius: int,
+    shadow_opacity: int,
+    shadow_offset: int,
+) -> Image.Image:
+    white = Image.new("RGBA", cutout.size, (255, 255, 255, 255))
+    if shadow == "subtle":
+        shadow_alpha = subtle_contact_shadow(
+            subject_mask,
+            shadow_radius,
+            shadow_opacity,
+            shadow_offset,
+        )
+        black = Image.new("RGBA", cutout.size, (0, 0, 0, 255))
+        white = Image.composite(black, white, shadow_alpha)
+    return Image.alpha_composite(white, cutout.convert("RGBA"))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, help="Source product image")
@@ -341,9 +451,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-high", type=int, default=184)
     parser.add_argument("--mask-expand", type=int, default=1)
     parser.add_argument("--mask-feather", type=float, default=0.8)
+    parser.add_argument(
+        "--edge-mode",
+        choices=("alpha", "binary"),
+        default="alpha",
+        help="Use trimap-based alpha matting for translucent edges or the legacy binary mask",
+    )
+    parser.add_argument(
+        "--alpha-fallback",
+        choices=("binary", "error"),
+        default="binary",
+        help="Behavior when the optional PyMatting runtime is unavailable",
+    )
+    parser.add_argument("--alpha-python", type=Path)
+    parser.add_argument("--alpha-foreground-threshold", type=int, default=235)
+    parser.add_argument("--alpha-background-threshold", type=int, default=5)
+    parser.add_argument("--alpha-foreground-erode", type=int, default=7)
+    parser.add_argument("--alpha-background-erode", type=int, default=25)
+    parser.add_argument("--alpha-margin", type=int, default=70)
+    parser.add_argument("--alpha-max-matte-side", type=int, default=3000)
     parser.add_argument("--debug-guidance-image", type=Path)
     parser.add_argument("--debug-raw-subject-mask", type=Path)
     parser.add_argument("--debug-subject-mask", type=Path, help="Optional detected-subject mask PNG")
+    parser.add_argument("--debug-alpha-mask", type=Path)
+    parser.add_argument("--debug-trimap", type=Path)
     parser.add_argument("--debug-background-mask", type=Path, help="Optional connected-background mask PNG")
     parser.add_argument("--corner-sample", type=int, default=32)
     parser.add_argument("--min-luminance", type=int, default=180)
@@ -391,22 +522,55 @@ def main() -> None:
             else original.convert("RGB")
         )
         raw_subject_mask = vision_subject_mask(guidance)
-        subject_mask = refine_subject_mask(
-            raw_subject_mask,
-            args.mask_low,
-            args.mask_high,
-            args.mask_expand,
-            args.mask_feather,
-        )
+        alpha_python = find_alpha_python(args.alpha_python) if args.edge_mode == "alpha" else None
+        if args.edge_mode == "alpha" and alpha_python is None and args.alpha_fallback == "error":
+            raise RuntimeError(
+                "PyMatting runtime not found. Run scripts/setup_alpha_matting.py or use --edge-mode binary"
+            )
+        if alpha_python is not None:
+            cutout = alpha_matte_cutout(
+                args.input,
+                raw_subject_mask,
+                alpha_python,
+                args.alpha_foreground_threshold,
+                args.alpha_background_threshold,
+                args.alpha_foreground_erode,
+                args.alpha_background_erode,
+                args.alpha_margin,
+                args.alpha_max_matte_side,
+                args.debug_alpha_mask,
+                args.debug_trimap,
+            )
+            subject_mask = cutout.getchannel("A")
+            retouched = apply_rgba_cutout_background(
+                cutout,
+                subject_mask,
+                args.shadow,
+                args.shadow_radius,
+                args.shadow_opacity,
+                args.shadow_offset,
+            )
+            active_edge_mode = "alpha"
+        else:
+            if args.edge_mode == "alpha":
+                print("Alpha matting runtime unavailable; falling back to binary mask")
+            subject_mask = refine_subject_mask(
+                raw_subject_mask,
+                args.mask_low,
+                args.mask_high,
+                args.mask_expand,
+                args.mask_feather,
+            )
+            retouched = apply_cutout_background(
+                original,
+                subject_mask,
+                args.shadow,
+                args.shadow_radius,
+                args.shadow_opacity,
+                args.shadow_offset,
+            )
+            active_edge_mode = "binary"
         mask = ImageOps.invert(subject_mask)
-        retouched = apply_cutout_background(
-            original,
-            subject_mask,
-            args.shadow,
-            args.shadow_radius,
-            args.shadow_opacity,
-            args.shadow_offset,
-        )
     else:
         mask = background_mask(
             original,
@@ -425,21 +589,21 @@ def main() -> None:
         retouched = apply_white_background(original, mask)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    retouched.convert("RGB").save(args.output, "PNG", optimize=True)
+    retouched.convert("RGB").save(args.output, "PNG", compress_level=1)
     if args.debug_subject_mask:
         args.debug_subject_mask.parent.mkdir(parents=True, exist_ok=True)
-        subject_mask.save(args.debug_subject_mask, "PNG", optimize=True)
+        subject_mask.save(args.debug_subject_mask, "PNG", compress_level=1)
     if args.debug_raw_subject_mask and raw_subject_mask is not None:
         args.debug_raw_subject_mask.parent.mkdir(parents=True, exist_ok=True)
-        raw_subject_mask.save(args.debug_raw_subject_mask, "PNG", optimize=True)
+        raw_subject_mask.save(args.debug_raw_subject_mask, "PNG", compress_level=1)
     if args.debug_guidance_image and guidance is not None:
         args.debug_guidance_image.parent.mkdir(parents=True, exist_ok=True)
-        guidance.save(args.debug_guidance_image, "PNG", optimize=True)
+        guidance.save(args.debug_guidance_image, "PNG", compress_level=1)
     if args.debug_background_mask:
         args.debug_background_mask.parent.mkdir(parents=True, exist_ok=True)
-        mask.save(args.debug_background_mask, "PNG", optimize=True)
+        mask.save(args.debug_background_mask, "PNG", compress_level=1)
 
-    background_pixels = sum(1 for value in mask.getdata() if value)
+    background_pixels = sum(mask.histogram()[1:])
     print(f"Saved: {args.output}")
     print(f"Mode: {args.mode}; shadow: {args.shadow}")
     if args.mode == "cutout":
@@ -448,6 +612,7 @@ def main() -> None:
             f"{args.mask_guide}; contrast={args.mask_contrast}; "
             f"range={args.mask_low}-{args.mask_high}; expand={args.mask_expand}"
         )
+        print(f"Edge mode: {active_edge_mode}")
     print(f"Source size: {original.size}; output size: {retouched.size}")
     print(f"Background pixels changed: {background_pixels}")
     print(f"Isolated protected components cleared: {cleared_components}")

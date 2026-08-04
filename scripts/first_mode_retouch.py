@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         help="Ignore approved assets and run the fallback processor",
     )
     parser.add_argument(
+        "--allow-edge-touch",
+        action="store_true",
+        help="Allow intentional close-up crops where the product reaches a canvas corner",
+    )
+    parser.add_argument(
         "--fallback-mode",
         choices=("background", "cutout"),
         default="cutout",
@@ -45,6 +50,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-raw-subject-mask", type=Path)
     parser.add_argument("--debug-guidance-image", type=Path)
     parser.add_argument("--debug-background-mask", type=Path)
+    parser.add_argument("--debug-alpha-mask", type=Path)
+    parser.add_argument("--debug-trimap", type=Path)
+    parser.add_argument(
+        "--edge-mode",
+        choices=("alpha", "binary"),
+        default="alpha",
+        help="Alpha matting preserves translucent frame edges; binary is the legacy fallback",
+    )
+    parser.add_argument(
+        "--alpha-fallback",
+        choices=("binary", "error"),
+        default="binary",
+    )
+    parser.add_argument("--alpha-python", type=Path)
+    parser.add_argument("--alpha-foreground-threshold", type=int, default=235)
+    parser.add_argument("--alpha-background-threshold", type=int, default=5)
+    parser.add_argument("--alpha-foreground-erode", type=int, default=7)
+    parser.add_argument("--alpha-background-erode", type=int, default=25)
+    parser.add_argument("--alpha-margin", type=int, default=70)
+    parser.add_argument("--alpha-max-matte-side", type=int, default=3000)
     parser.add_argument("--mask-contrast", type=float, default=1.35)
     parser.add_argument("--mask-low", type=int, default=78)
     parser.add_argument("--mask-high", type=int, default=184)
@@ -70,7 +95,7 @@ def approved_candidates(source: Path, explicit: Path | None) -> list[Path]:
     return candidates
 
 
-def validate_image(path: Path) -> tuple[int, int]:
+def validate_image(path: Path, allow_edge_touch: bool = False) -> tuple[int, int]:
     with Image.open(path) as image:
         image.load()
         width, height = image.size
@@ -83,18 +108,18 @@ def validate_image(path: Path) -> tuple[int, int]:
         )
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Invalid output dimensions: {path}")
-    if any(pixel != (255, 255, 255) for pixel in corners):
+    if not allow_edge_touch and any(pixel != (255, 255, 255) for pixel in corners):
         raise RuntimeError(f"Output corners are not pure white: {path}")
     return width, height
 
 
-def copy_approved(source: Path, output: Path) -> bool:
+def copy_approved(source: Path, output: Path, allow_edge_touch: bool = False) -> bool:
     if source.resolve() == output.resolve():
-        validate_image(output)
+        validate_image(output, allow_edge_touch)
         return True
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output)
-    validate_image(output)
+    validate_image(output, allow_edge_touch)
     return True
 
 
@@ -128,8 +153,26 @@ def run_fallback(args: argparse.Namespace, output: Path) -> None:
                 str(args.mask_expand),
                 "--mask-feather",
                 str(args.mask_feather),
+                "--edge-mode",
+                args.edge_mode,
+                "--alpha-fallback",
+                args.alpha_fallback,
+                "--alpha-foreground-threshold",
+                str(args.alpha_foreground_threshold),
+                "--alpha-background-threshold",
+                str(args.alpha_background_threshold),
+                "--alpha-foreground-erode",
+                str(args.alpha_foreground_erode),
+                "--alpha-background-erode",
+                str(args.alpha_background_erode),
+                "--alpha-margin",
+                str(args.alpha_margin),
+                "--alpha-max-matte-side",
+                str(args.alpha_max_matte_side),
             )
         )
+        if args.alpha_python:
+            command.extend(("--alpha-python", str(args.alpha_python)))
     if args.debug_subject_mask:
         command.extend(("--debug-subject-mask", str(args.debug_subject_mask)))
     if args.debug_background_mask:
@@ -138,8 +181,12 @@ def run_fallback(args: argparse.Namespace, output: Path) -> None:
         command.extend(("--debug-raw-subject-mask", str(args.debug_raw_subject_mask)))
     if args.debug_guidance_image:
         command.extend(("--debug-guidance-image", str(args.debug_guidance_image)))
+    if args.debug_alpha_mask:
+        command.extend(("--debug-alpha-mask", str(args.debug_alpha_mask)))
+    if args.debug_trimap:
+        command.extend(("--debug-trimap", str(args.debug_trimap)))
     subprocess.run(command, check=True)
-    validate_image(output)
+    validate_image(output, args.allow_edge_touch)
 
 
 def main() -> None:
@@ -152,15 +199,15 @@ def main() -> None:
     if not args.force_process:
         for candidate in approved_candidates(args.input, args.approved):
             if candidate.is_file():
-                copy_approved(candidate, output)
-                width, height = validate_image(output)
+                copy_approved(candidate, output, args.allow_edge_touch)
+                width, height = validate_image(output, args.allow_edge_touch)
                 print(f"Saved: {output}")
                 print(f"Mode: approved-fast-path; source: {candidate}")
                 print(f"Output size: {width}x{height}")
                 return
 
     run_fallback(args, output)
-    width, height = validate_image(output)
+    width, height = validate_image(output, args.allow_edge_touch)
     print(f"Saved: {output}")
     print(f"Mode: {args.fallback_mode}-fallback; visual QA required")
     print(f"Output size: {width}x{height}")
